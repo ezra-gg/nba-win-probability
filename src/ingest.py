@@ -80,6 +80,12 @@ def get_game_index(seasons: list[str], season_type: str = "Regular Season") -> p
                             game_id, len(home), len(away))
                 continue
             home, away = home.iloc[0], away.iloc[0]
+            # The finder also returns games still in progress, with WL unset.
+            # Skip them: their score isn't final, the label would be wrong, and
+            # play-by-play pulled mid-game would be cached partial forever.
+            if home["WL"] not in ("W", "L") or away["WL"] not in ("W", "L"):
+                log.info("Skipping %s: not final yet (in progress or not started).", game_id)
+                continue
             records.append({
                 "game_id": str(game_id),
                 "game_date": home["GAME_DATE"],

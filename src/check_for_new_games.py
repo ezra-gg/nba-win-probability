@@ -39,7 +39,8 @@ REFRESH_THRESHOLD = 1
 def current_season_game_ids() -> set[str]:
     """Completed-game IDs for the current season, across regular season + playoffs.
 
-    LeagueGameFinder returns only completed games, so every ID here is final.
+    LeagueGameFinder also returns games still in progress (WL unset), so keep
+    only rows with a result - matching ingest, which skips unfinished games.
     Two cheap index calls, no play-by-play - this is the whole point of the gate.
     """
     season = current_season()
@@ -51,7 +52,9 @@ def current_season_game_ids() -> set[str]:
             league_id_nullable="00",
             timeout=30,
         )
-        ids.update(finder.get_data_frames()[0]["GAME_ID"].astype(str))
+        rows = finder.get_data_frames()[0]
+        rows = rows[rows["WL"].isin(["W", "L"])]
+        ids.update(rows["GAME_ID"].astype(str))
     log.info("Current season (%s): %d completed games reported.", season, len(ids))
     return ids
 

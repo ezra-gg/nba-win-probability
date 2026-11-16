@@ -1,10 +1,11 @@
 """
 Fetch live game state from the NBA API and translate it into model-ready features.
 
-Uses nba_api.stats V3 endpoints (stats.nba.com) which are not blocked by the CDN's
-bot-detection layer. The JSON shapes match the CDN, so parse_clock and
-action_game_state are unaffected. This module handles fetch + parse only;
-model inference stays in predict.py / the app.
+Uses the stats.nba.com ScoreboardV3 endpoint, which is not blocked by the CDN's
+bot-detection layer and updates score, period and clock while games are in
+progress. (Play-by-play is NOT an option for live games: PlayByPlayV3 returns no
+actions until a game is final.) This module handles fetch + parse only; model
+inference stays in predict.py / the app.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from __future__ import annotations
 import re
 from datetime import date
 
-from nba_api.stats.endpoints import playbyplayv3, scoreboardv3
+from nba_api.stats.endpoints import scoreboardv3
 
 # Game status codes returned by ScoreboardV3.
 STATUS_PRE = 1
@@ -47,12 +48,6 @@ def today_games() -> list[dict]:
     return out
 
 
-def game_actions(game_id: str) -> list[dict]:
-    """All logged actions for a game so far, in play order."""
-    pbp = playbyplayv3.PlayByPlayV3(game_id=game_id)
-    return pbp.play_by_play.get_data_frame().to_dict("records")
-
-
 def parse_clock(clock: str) -> float:
     """Return seconds remaining in the current period from an NBA clock string.
 
@@ -72,19 +67,19 @@ def parse_clock(clock: str) -> float:
     return int(m.group(1)) * 60 + float(m.group(2))
 
 
-def action_game_state(action: dict) -> dict:
-    """Game state dict for one action, ready to pass to game_state_seconds().
+def scoreboard_game_state(game: dict) -> dict:
+    """Game state for one today_games() entry, ready for game_state_seconds().
 
     Keys: period, clock_seconds (left in this period), score_diff (home - away),
-    is_overtime.
+    is_overtime. Between periods the clock is empty, which parses to 0.0 - the
+    end of the period just played, which is where the game actually stands.
     """
-    period = int(action.get("period", 1))
-    clock_seconds = parse_clock(action.get("clock", ""))
-    home_score = int(action.get("scoreHome") or 0)
-    away_score = int(action.get("scoreAway") or 0)
+    period = max(1, int(game.get("period") or 1))
+    home_score = int(game.get("home_score") or 0)
+    away_score = int(game.get("away_score") or 0)
     return {
         "period":        period,
-        "clock_seconds": clock_seconds,
+        "clock_seconds": parse_clock(game.get("game_clock", "")),
         "score_diff":    home_score - away_score,
         "is_overtime":   int(period > 4),
     }

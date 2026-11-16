@@ -10,6 +10,7 @@ Three views:
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -20,8 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from live_feed import (  # noqa: E402
     STATUS_LIVE,
-    action_game_state,
-    game_actions,
+    scoreboard_game_state,
     today_games,
 )
 from predict import (  # noqa: E402
@@ -280,7 +280,7 @@ with overview_tab:
                    range=[0, 1], tickformat=".0%"),
         height=max(440, 20 * len(field)), margin=dict(t=30, l=10),
     )
-    event = st.plotly_chart(fig, use_container_width=True,
+    event = st.plotly_chart(fig, width="stretch",
                             on_select="rerun", selection_mode="points")
 
     # Drill-down appears only after the user clicks a bar.
@@ -314,6 +314,10 @@ with replay_tab:
 
     if game_id:
         df = game_curve(game_id)
+    if game_id and df.empty:
+        st.info("No play-by-play for this game yet - it will appear after the next "
+                "data refresh.")
+    elif game_id:
         g = games[games["game_id"] == game_id].iloc[0]
         home, away = g.home_abbr, g.away_abbr
         home_won = g.home_pts > g.away_pts
@@ -356,7 +360,7 @@ with replay_tab:
             xaxis=dict(title="Game progression", tickvals=tickvals, ticktext=ticktext),
             height=440, margin=dict(t=30),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         winner = home if home_won else away
         st.markdown(
@@ -364,19 +368,98 @@ with replay_tab:
             f"**{name(winner)} won.**  Pre-game model: P({name(viewed_team)} win) = {p_curve.iloc[0]:.0%}"
         )
 
+@st.cache_resource
+def live_history() -> tuple[dict[str, list[dict]], threading.Lock]:
+    """Scoreboard readings per live game, shared across every viewer session.
+
+    Live play-by-play isn't available (PlayByPlayV3 is empty until a game is
+    final), so the live curve is built from successive scoreboard snapshots.
+    Keeping them server-side means the curve covers the whole time anyone has
+    had the app open, not just the current viewer's session.
+    """
+    return {}, threading.Lock()
+
+
+def live_features(state: dict, home: str, away: str) -> dict:
+    """One model-ready feature row for a live game state."""
+    predictor = get_predictor()
+    rating_diff = predictor.ratings.get(home, 0) - predictor.ratings.get(away, 0)
+    home_rapm, home_box = predictor.roster_value.get(home, (None, None))
+    away_rapm, away_box = predictor.roster_value.get(away, (None, None))
+    secs, is_ot = game_state_seconds(state["period"], state["clock_seconds"])
+    return {
+        "seconds_remaining":     secs,
+        "score_diff":            state["score_diff"],
+        "is_overtime":           is_ot,
+        "is_playoff":            0,
+        "rating_diff":           rating_diff,
+        "roster_value_diff":     (home_rapm - away_rapm
+                                  if home_rapm is not None and away_rapm is not None else 0.0),
+        "roster_value_box_diff": (home_box - away_box
+                                  if home_box is not None and away_box is not None else 0.0),
+        "period":                state["period"],
+    }
+
+
+def live_p_home(row: dict) -> float:
+    model, features = get_model()
+    decided = endgame_certainty(row["seconds_remaining"], row["score_diff"])
+    if decided is not None:
+        return decided
+    return float(model.predict_proba(pd.DataFrame([row])[features])[:, 1][0])
+
+
+def record_live_reading(game: dict) -> list[dict]:
+    """Append this scoreboard snapshot to the game's history (if it changed)
+    and return the history. The curve is seeded with the pre-game number at
+    tip-off so it always starts from the model's prior."""
+    home, away = game["home"], game["away"]
+    row = live_features(scoreboard_game_state(game), home, away)
+    point = {
+        "period":     row["period"],
+        "elapsed":    elapsed_seconds(row["period"], row["seconds_remaining"]),
+        "score_home": int(game["home_score"] or 0),
+        "score_away": int(game["away_score"] or 0),
+        "p_home":     live_p_home(row),
+    }
+    history, lock = live_history()
+    with lock:
+        points = history.setdefault(game["game_id"], [])
+        if not points:
+            tip = live_features({"period": 1, "clock_seconds": 720.0, "score_diff": 0},
+                                home, away)
+            points.append({"period": 1, "elapsed": 0.0, "score_home": 0,
+                           "score_away": 0, "p_home": live_p_home(tip)})
+        last = points[-1]
+        if (point["elapsed"], point["score_home"], point["score_away"]) != (
+                last["elapsed"], last["score_home"], last["score_away"]):
+            points.append(point)
+        return list(points)
+
+
+def prune_live_history(live_ids: set[str]) -> None:
+    """Drop history for games that are no longer in progress."""
+    history, lock = live_history()
+    with lock:
+        for gid in [g for g in history if g not in live_ids]:
+            del history[gid]
+
+
 with live_tab:
     st.caption("Win probability updating in real time for any game currently in progress. "
-               "Refreshes every 30 seconds.")
+               "Refreshes every 30 seconds from the live scoreboard; the curve builds "
+               "from when the app was first opened during the game.")
 
     @st.fragment(run_every=30)
     def live_section() -> None:
         try:
             games = today_games()
         except Exception as exc:
-            st.warning(f"Could not reach the NBA CDN: {exc}")
+            st.warning(f"Could not reach the NBA scoreboard: {exc}")
             return
 
         in_progress = [g for g in games if g["status"] == STATUS_LIVE]
+        prune_live_history({g["game_id"] for g in in_progress})
         if not in_progress:
             other = [g for g in games if g["status"] != STATUS_LIVE]
             if other:
@@ -386,6 +469,10 @@ with live_tab:
             else:
                 st.info("No NBA games scheduled today.")
             return
+
+        # Record every live game each tick, not just the one on screen, so
+        # switching games shows a curve that has been building all along.
+        histories = {g["game_id"]: record_live_reading(g) for g in in_progress}
 
         game_labels = {
             g["game_id"]: f"{name(g['away'])} @ {name(g['home'])}"
@@ -397,53 +484,7 @@ with live_tab:
         )
         selected = next(g for g in in_progress if g["game_id"] == selected_id)
         home, away = selected["home"], selected["away"]
-
-        try:
-            actions = game_actions(selected_id)
-        except Exception as exc:
-            st.warning(f"Could not fetch play-by-play: {exc}")
-            return
-
-        # Filter to actions that have a clock stamp and a score (skip
-        # administrative events at the top of the feed).
-        scored = [a for a in actions if a.get("clock") and a.get("scoreHome") is not None]
-        if not scored:
-            st.info("Waiting for the first scored play...")
-            return
-
-        predictor = get_predictor()
-        model, features = get_model()
-
-        rating_diff = predictor.ratings.get(home, 0) - predictor.ratings.get(away, 0)
-        home_rapm, home_box = predictor.roster_value.get(home, (None, None))
-        away_rapm, away_box = predictor.roster_value.get(away, (None, None))
-        roster_diff = (home_rapm - away_rapm
-                       if home_rapm is not None and away_rapm is not None else 0.0)
-        roster_box_diff = (home_box - away_box
-                           if home_box is not None and away_box is not None else 0.0)
-
-        rows = []
-        for a in scored:
-            state = action_game_state(a)
-            secs, is_ot = game_state_seconds(state["period"], state["clock_seconds"])
-            rows.append({
-                "seconds_remaining":     secs,
-                "score_diff":            state["score_diff"],
-                "is_overtime":           is_ot,
-                "is_playoff":            0,
-                "rating_diff":           rating_diff,
-                "roster_value_diff":     roster_diff,
-                "roster_value_box_diff": roster_box_diff,
-                "period":                state["period"],
-                "action_number":         int(a.get("actionNumber", 0)),
-            })
-        df = pd.DataFrame(rows)
-        df["p_home"] = model.predict_proba(df[features])[:, 1]
-        decided = [endgame_certainty(s, d)
-                   for s, d in zip(df["seconds_remaining"], df["score_diff"])]
-        df["p_home"] = [c if c is not None else p for c, p in zip(decided, df["p_home"])]
-        df["elapsed"] = [elapsed_seconds(p, s)
-                         for p, s in zip(df["period"], df["seconds_remaining"])]
+        df = pd.DataFrame(histories[selected_id])
 
         perspective = st.radio(
             "Show odds for", [name(home), name(away)],
@@ -459,14 +500,21 @@ with live_tab:
         m2.metric(f"{name(away)} score", selected["away_score"])
         st.metric(f"P({name(viewed)} win)", f"{latest_p:.1%}")
 
-        tickvals, ticktext = quarter_ticks(df["period"].tolist())
+        # Label every period up to the current one, even ones the curve skipped
+        # (the app may have been opened mid-game).
+        tickvals, ticktext = quarter_ticks(list(range(1, int(df["period"].max()) + 1)))
+        scoreboard =[f"{home} {h} - {a} {away}"
+                      for h, a in zip(df["score_home"], df["score_away"])]
         fig = go.Figure()
         fig.add_hline(y=0.5, line_dash="dot", line_color="gray")
         for x in tickvals[1:]:
             fig.add_vline(x=x, line_dash="dot", line_color="#e0e0e0")
         fig.add_trace(go.Scatter(
-            x=df["elapsed"], y=p_curve, mode="lines",
-            line=dict(color="#F58426", width=2), name=f"P({viewed} win)",
+            x=df["elapsed"], y=p_curve, mode="lines+markers",
+            line=dict(color="#F58426", width=2), marker=dict(size=4),
+            name=f"P({viewed} win)", customdata=scoreboard,
+            hovertemplate=(f"%{{customdata}}<br>{name(viewed)} win: "
+                           f"%{{y:.0%}}<extra></extra>"),
         ))
         fig.update_layout(
             yaxis=dict(title=f"Percent Chance of {name(viewed)} Winning",
@@ -474,6 +522,6 @@ with live_tab:
             xaxis=dict(title="Game progression", tickvals=tickvals, ticktext=ticktext),
             height=440, margin=dict(t=30),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     live_section()
